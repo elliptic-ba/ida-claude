@@ -5,7 +5,7 @@ about the current function, run an agent loop that drives the database
 (list / read / rename / comment / jump), or fall back to a plain chat with
 the logged-in `claude` CLI.
 
-![Claude Code UI](Capture.png)
+![Claude Code UI](Capture1.png)
 
 ## Features
 
