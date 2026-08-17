@@ -183,8 +183,11 @@ class _FlushSubmenuStyle(QtWidgets.QProxyStyle):
             metric, option, widget)
 
 
-from ida_claude.claude_client import ClaudeClient, ClaudeError, CancelledError
-from ida_claude.cli_client import ClaudeCliClient, CliError
+from ida_claude.claude_client import (
+    ClaudeClient, ClaudeError, CancelledError, model_supports_effort,
+)
+from ida_claude.cli_client import ClaudeCliClient, CliError, CliCancelled
+from ida_claude.mcp_server import IdaMcpServer, McpServerError
 from ida_claude.ida_context import (
     get_current_function_context,
     get_function_context_by_name,
@@ -282,12 +285,21 @@ def _refresh_ida_views_after_edit(params):
 
 
 # (display label, model id). Labels go in the combo; ids go out on the wire.
+# The same id works for both paths: the Anthropic API takes it as `model`, the
+# CLI takes it as `--model`. Ids are the undated aliases -- do not append date
+# suffixes, they are complete as written.
 MODELS = [
-    ("Opus 4.7",   "claude-opus-4-7"),
-    ("Opus 4.6",   "claude-opus-4-6"),
-    ("Sonnet 4.6", "claude-sonnet-4-6"),
-    ("Haiku 4.5",  "claude-haiku-4-5-20251001"),
+    ("Opus 5",    "claude-opus-5"),
+    ("Sonnet 5",  "claude-sonnet-5"),
+    ("Haiku 4.5", "claude-haiku-4-5"),
+    ("Opus 4.8",  "claude-opus-4-8"),
+    ("Fable 5",   "claude-fable-5"),
 ]
+
+# output_config.effort / --effort. Controls how much the model thinks and how
+# much work it does per turn; "high" is the API default.
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+DEFAULT_EFFORT = "high"
 
 QUICK_ACTIONS = [
     ("(quick actions...)", None),
@@ -326,6 +338,149 @@ _ACCENT     = "#cc785c"   # Claude coral (replaces the reference's amber-600)
 _ACCENT_HOV = "#d68870"
 
 
+# ---------- transcript: Claude Code terminal look ----------
+# The panel used to render as a chat log (bold "you" lines, arrows, italics).
+# This section reproduces the CLI's transcript instead: a coral dot per
+# assistant/tool turn, results hanging off a box-drawing branch, and
+# everything monospaced and dim except the text that matters.
+_T_TEXT   = "#d7d4cd"   # body copy
+_T_BRIGHT = "#faf9f5"   # bold, headings, tool names
+_T_DIM    = "#8a857c"   # tool arguments, results
+_T_FAINT  = "#6b6660"   # prompt markers, system notices
+_T_ERR    = "#e0785f"
+_T_CODEBG = "#1c1b19"
+
+# Markers. Deliberately the widely-available box-drawing / geometric glyphs
+# rather than the CLI's rarer ⏺ / ⎿ -- the same shape, but present in the
+# monospace fonts IDA ships with on Windows and Linux, so no tofu.
+_M_DOT    = "●"    # ● turn marker
+_M_BRANCH = "└"    # └ result branch
+_M_PROMPT = "&gt;"      # > user input
+
+# Qt's rich text engine understands a subset of CSS 2.1: colors, font
+# weight/style/size, margins and backgrounds work; layout properties mostly
+# don't. Everything below stays inside that subset.
+_DOC_CSS = (
+    "pre  { background:%(codebg)s; padding:6px; white-space:pre-wrap;"
+    "       color:%(text)s; margin-top:4px; margin-bottom:4px;"
+    "       margin-left:14px; }"
+    "code { color:#e8c48a; }"
+    "a    { color:%(accent)s; }"
+    # Headings read as bold text in a terminal, not as a colored banner.
+    "h1   { color:%(bright)s; font-size:11pt; font-weight:bold;"
+    "       margin-top:8px; margin-bottom:1px; }"
+    "h2   { color:%(bright)s; font-size:10.5pt; font-weight:bold;"
+    "       margin-top:8px; margin-bottom:1px; }"
+    "h3   { color:%(text)s; font-size:10pt; font-weight:bold;"
+    "       margin-top:6px; margin-bottom:1px; }"
+    "b, strong { color:%(bright)s; }"
+    "blockquote { color:%(dim)s; margin-left:14px; }"
+    "li   { color:%(text)s; }"
+    "table.mdtable { margin: 4px 0; }"
+    "table.mdtable th { background:#2a2826; color:%(bright)s;"
+    "                   padding:3px 8px; text-align:left; }"
+    "table.mdtable td { padding:3px 8px; color:%(text)s; }"
+    # --- transcript rows -------------------------------------------------
+    ".user    { color:%(text)s; margin-top:6px; }"
+    ".prompt  { color:%(faint)s; }"
+    ".msg     { color:%(text)s; }"
+    ".dot     { color:%(accent)s; font-weight:bold; }"
+    ".tname   { color:%(bright)s; }"
+    ".targs   { color:%(dim)s; }"
+    ".branch  { color:%(faint)s; margin-left:6px; }"
+    ".bres    { color:%(dim)s; }"
+    ".sys     { color:%(faint)s; }"
+    ".err     { color:%(err)s; }"
+    # --- C highlighting inside <pre> -------------------------------------
+    ".ckw     { color:#c586c0; }"
+    ".cty     { color:#4ec9b0; }"
+    ".cstr    { color:#ce9178; }"
+    ".ccmt    { color:#6a9955; font-style:italic; }"
+    ".cpre    { color:#9b9b9b; }"
+    ".cnum    { color:#e8c48a; }"
+    ".cfn     { color:#dcdcaa; }"
+    # --- inline emphasis from _render_inline ------------------------------
+    ".fn      { color:%(bright)s; }"
+    ".num     { color:#e8c48a; }"
+    ".addr    { color:#81c8f0; }"
+) % {
+    "text": _T_TEXT, "bright": _T_BRIGHT, "dim": _T_DIM, "faint": _T_FAINT,
+    "err": _T_ERR, "accent": _ACCENT, "codebg": _T_CODEBG,
+}
+
+
+def _mono_font(point_size):
+    """The platform's fixed-pitch UI font, so the transcript reads like a
+    terminal on Windows (Consolas), macOS (Menlo) and Linux (DejaVu Sans
+    Mono) without hardcoding a family that may not exist."""
+    try:
+        f = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        if f.family():
+            f.setPointSize(point_size)
+            return f
+    except Exception:
+        pass
+    f = QtGui.QFont("Consolas", point_size)
+    f.setStyleHint(QtGui.QFont.Monospace)
+    return f
+
+
+# ---------- transcript row builders ----------
+# Module-level and pure so the exact markup the panel renders can be
+# unit-tested (and previewed in a browser) without a running IDA.
+
+def _html_user(text):
+    """`> what does sub_401000 do` -- the CLI's echo of your prompt."""
+    return ('<div class="user"><span class="prompt">%s</span> %s</div>'
+            % (_M_PROMPT, _md_to_html(text)))
+
+
+def _html_assistant(body_html):
+    """A coral dot, then the reply. Body is already-rendered markdown."""
+    return ('<div class="msg"><span class="dot">%s</span> %s</div>'
+            % (_M_DOT, body_html))
+
+
+def _fmt_tool_args(params):
+    """Render tool arguments the way the CLI heads a tool call: the bare
+    value when there's one argument, `k=v` pairs when there are several."""
+    if not isinstance(params, dict) or not params:
+        return ""
+    def val(v):
+        if isinstance(v, str):
+            return v
+        return _short_repr(v, 40)
+    if len(params) == 1:
+        only = val(list(params.values())[0])
+        return only if len(only) <= 60 else only[:57] + "..."
+    parts = ["%s=%s" % (k, val(v)) for k, v in params.items()]
+    joined = ", ".join(parts)
+    return joined if len(joined) <= 70 else joined[:67] + "..."
+
+
+def _html_tool_call(name, params):
+    return ('<div class="msg"><span class="dot">%s</span> '
+            '<span class="tname">%s</span>'
+            '<span class="targs">(%s)</span></div>'
+            % (_M_DOT, html.escape(name),
+               html.escape(_fmt_tool_args(params))))
+
+
+def _html_tool_result(result, is_error, max_chars=160):
+    """The `└ ...` line hanging off the call above it."""
+    lines = (result or "").strip().splitlines()
+    preview = lines[0] if lines else ""
+    if len(preview) > max_chars:
+        preview = preview[:max_chars - 3] + "..."
+    if len(lines) > 1:
+        preview += "  (+%d lines)" % (len(lines) - 1)
+    cls = "err" if is_error else "bres"
+    if is_error and not preview:
+        preview = "failed"
+    return ('<div class="branch">%s <span class="%s">%s</span></div>'
+            % (_M_BRANCH, cls, html.escape(preview)))
+
+
 # ---------- thread bridge ----------
 
 class _Bridge(QtCore.QObject):
@@ -362,6 +517,9 @@ class ClaudeChatForm(QtWidgets.QWidget):
         self._pending_attachments = []
         self._usage_totals = _load_usage_from_netnode()
         self._turn_tool_calls = 0
+        # Tail of the current turn's reasoning summary, shown in the status
+        # line while the model thinks (see _refresh_status).
+        self._thinking_tail = ""
         # Streaming buffer + anchor: text_delta events append into the
         # conversation pane live; the anchor tracks where the current
         # assistant block started so we can re-render in-place. A separate
@@ -381,8 +539,18 @@ class ClaudeChatForm(QtWidgets.QWidget):
         # Undo ledger: list of "batches" each holding the reversible edits
         # produced by a single agent turn.
         self._undo_batches = []
-        # 0 = API key (Anthropic direct), 1 = Claude CLI.
+        # 0 = API key (Anthropic direct), 1 = Claude CLI (subscription).
         self._auth_mode = 0
+        # MCP server exposing ida_tools to the CLI. Started lazily on the
+        # first CLI turn and left running for the life of the panel.
+        self._mcp = None
+        self._effort = DEFAULT_EFFORT
+        # Gate for MCP tool execution. The server outlives any single turn (the
+        # CLI reconnects per invocation), so without this a `claude` process
+        # that survived a cancel -- or any other local process holding the
+        # token -- could still drive edits into the database. Set only while a
+        # CLI turn is genuinely in flight.
+        self._cli_turn_active = threading.Event()
         self._build_ui()
         self._sanitize_history_tail()
         self._replay_history()
@@ -421,7 +589,7 @@ class ClaudeChatForm(QtWidgets.QWidget):
         self.conversation = QtWidgets.QTextBrowser()
         self.conversation.setObjectName("claudeConversation")
         self.conversation.setOpenExternalLinks(True)
-        self.conversation.setFont(QtGui.QFont("Consolas", 10))
+        self.conversation.setFont(_mono_font(10))
         self.conversation.setStyleSheet(
             "QTextBrowser#claudeConversation {"
             "  background-color: #262624;"
@@ -469,47 +637,7 @@ class ClaudeChatForm(QtWidgets.QWidget):
             "  background: transparent;"
             "}"
         )
-        self.conversation.document().setDefaultStyleSheet(
-            "pre  { background:#1f1e1c; padding:6px;"
-            "       border-radius:4px; white-space:pre-wrap;"
-            "       color:#eaeae8; }"
-            "code { background:#1f1e1c; padding:1px 4px;"
-            "       border-radius:3px; color:#e8c48a; }"
-            "a    { color:#cc785c; }"
-            "h1   { color:#cc785c; font-size:13pt; font-weight:bold;"
-            "       margin-top:10px; margin-bottom:2px; }"
-            "h2   { color:#cc785c; font-size:12pt; font-weight:bold;"
-            "       margin-top:10px; margin-bottom:2px; }"
-            "h3   { color:#d69379; font-size:11pt; font-weight:bold;"
-            "       margin-top:8px; margin-bottom:2px; }"
-            "b, strong { color:#faf9f5; }"
-            "blockquote { color:#c5bfb5; }"
-            "li   { color:#eaeae8; }"
-            "table.mdtable { margin: 6px 0; }"
-            "table.mdtable th {"
-            " background:#2a2826; color:#faf9f5;"
-            " padding:4px 8px; text-align:left; }"
-            "table.mdtable td {"
-            " padding:4px 8px; color:#eaeae8; }"
-            ".you     { font-weight:bold; color:#faf9f5; }"
-            ".claude  { color:#eaeae8; }"
-            ".sys     { font-style:italic; color:#8b857c; }"
-            ".err     { font-weight:bold; font-style:italic;"
-            "           color:#e07a5f; }"
-            ".tool    { font-style:italic; color:#7ec491; }"
-            ".toolret { font-style:italic; color:#a59f97; }"
-            ".fn      { color:#b48ef0; font-weight:bold; }"
-            ".num     { color:#e8c48a; }"
-            ".addr    { color:#81c8f0; }"
-            # C code highlighting (scoped inside <pre>):
-            ".ckw     { color:#c586c0; }"        # keywords
-            ".cty     { color:#4ec9b0; }"        # types
-            ".cstr    { color:#ce9178; }"        # strings / chars
-            ".ccmt    { color:#6a9955; font-style:italic; }"  # comments
-            ".cpre    { color:#9b9b9b; }"        # preprocessor
-            ".cnum    { color:#e8c48a; }"        # numbers in code
-            ".cfn     { color:#dcdcaa; }"        # function names (callee)
-        )
+        self.conversation.document().setDefaultStyleSheet(_DOC_CSS)
 
         # --- Claude-style input card ---
         # Rounded #30302E frame; textarea on top, toolbar row inside at bottom.
@@ -670,10 +798,9 @@ class ClaudeChatForm(QtWidgets.QWidget):
                 logo_lbl.setStyleSheet("background: transparent;")
                 wl.addWidget(logo_lbl, 0, QtCore.Qt.AlignVCenter)
         welcome_text = QtWidgets.QLabel("What are we reversing today?")
+        welcome_text.setFont(_mono_font(15))
         welcome_text.setStyleSheet(
             "color:#C2C0B6; background: transparent;"
-            " font-family:Georgia,'Times New Roman',serif;"
-            " font-size:20pt; font-weight:300;"
         )
         wl.addWidget(welcome_text, 0, QtCore.Qt.AlignVCenter)
         wl.addStretch(1)
@@ -701,9 +828,9 @@ class ClaudeChatForm(QtWidgets.QWidget):
 
         # --- status line: tokens + tool-call totals ---
         self.status_label = QtWidgets.QLabel("")
+        self.status_label.setFont(_mono_font(8))
         self.status_label.setStyleSheet(
-            "color:%s; font-size:9pt; padding:2px 4px; background: transparent;"
-            % _TEXT_MUTED
+            "color:%s; padding:2px 4px; background: transparent;" % _T_FAINT
         )
         self.status_label.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse
@@ -872,11 +999,12 @@ class ClaudeChatForm(QtWidgets.QWidget):
         self.act_auth_api.triggered.connect(
             lambda _checked=False: self._on_auth_changed(0)
         )
-        self.act_auth_cli = QAction("Claude CLI (account)", auth_menu)
+        self.act_auth_cli = QAction("Claude CLI (subscription)", auth_menu)
         self.act_auth_cli.setCheckable(True)
         self.act_auth_cli.setToolTip(
-            "Shell out to the logged-in `claude` CLI. Text-only - IDA tools "
-            "are not invoked in CLI mode."
+            "Run turns through the logged-in `claude` CLI, billed against "
+            "your Claude subscription. IDA tools are exposed to it over a "
+            "local MCP server, so tool use works the same as API mode."
         )
         self.act_auth_cli.triggered.connect(
             lambda _checked=False: self._on_auth_changed(1)
@@ -889,6 +1017,28 @@ class ClaudeChatForm(QtWidgets.QWidget):
         act_key = menu.addAction("Set API key...")
         act_key.triggered.connect(self._prompt_api_key)
 
+        # Effort -- maps to output_config.effort (API) / --effort (CLI).
+        effort_menu = menu.addMenu("Effort")
+        effort_menu.setStyleSheet(menu_style)
+        effort_menu.setStyle(self._flush_submenu_style)
+        effort_grp = QActionGroup(effort_menu)
+        effort_grp.setExclusive(True)
+        for level in EFFORTS:
+            act = QAction(level, effort_menu)
+            act.setCheckable(True)
+            act.setChecked(level == DEFAULT_EFFORT)
+            act.triggered.connect(
+                lambda _checked=False, lv=level: self._on_effort_changed(lv)
+            )
+            effort_grp.addAction(act)
+            effort_menu.addAction(act)
+        # A QMenu's own tooltip never renders; the tooltip the user sees
+        # belongs to the action that opens it.
+        effort_menu.menuAction().setToolTip(
+            "How hard the model works per turn. 'low'/'medium' are cheaper "
+            "and faster; 'xhigh'/'max' dig deeper on hard binaries."
+        )
+
         menu.addSeparator()
 
         self.chk_tools = QAction("Use tools", menu)
@@ -896,7 +1046,8 @@ class ClaudeChatForm(QtWidgets.QWidget):
         self.chk_tools.setChecked(True)
         self.chk_tools.setToolTip(
             "Let Claude call IDA tools (read, rename, comment, jump, etc.) "
-            "in an agent loop. API-key mode only."
+            "in an agent loop. In CLI mode the tools are served over a local "
+            "MCP server; unchecking sends a plain text-only turn."
         )
         menu.addAction(self.chk_tools)
 
@@ -933,10 +1084,11 @@ class ClaudeChatForm(QtWidgets.QWidget):
 
         self.chk_show_tools = QAction("Show tool activity", menu)
         self.chk_show_tools.setCheckable(True)
-        self.chk_show_tools.setChecked(False)
+        self.chk_show_tools.setChecked(True)
         self.chk_show_tools.setToolTip(
-            "Show each tool call and its result inline in the chat. Off by "
-            "default -- you'll still see a count in the status line."
+            "Show each tool call and its result inline, the way the terminal "
+            "does. Untick for prose only -- you'll still get a count in the "
+            "status line."
         )
         menu.addAction(self.chk_show_tools)
 
@@ -966,6 +1118,13 @@ class ClaudeChatForm(QtWidgets.QWidget):
         menu.addAction(budget_action)
 
         menu.addSeparator()
+
+        self.act_diag = menu.addAction("CLI / MCP diagnostics")
+        self.act_diag.setToolTip(
+            "Print the detected `claude` binary, its version, and the local "
+            "MCP endpoint serving the IDA tools."
+        )
+        self.act_diag.triggered.connect(self._on_diagnostics)
 
         self.act_undo = menu.addAction("Undo last edits")
         self.act_undo.setToolTip(
@@ -1020,10 +1179,10 @@ class ClaudeChatForm(QtWidgets.QWidget):
         sb.setValue(sb.maximum())
 
     def _append_user(self, text):
-        self._append_raw('<div class="you">' + _md_to_html(text) + '</div><br>')
+        self._append_raw(_html_user(text))
 
     def _append_claude(self, text):
-        self._append_raw('<div class="claude">' + _md_to_html(text) + '</div><br>')
+        self._append_raw(_html_assistant(_md_to_html(text)))
 
     def _append_sys(self, text):
         self._append_raw('<div class="sys">' + text + '</div>')
@@ -1032,32 +1191,12 @@ class ClaudeChatForm(QtWidgets.QWidget):
         self._append_raw('<div class="err">' + html.escape(text) + '</div>')
 
     def _append_tool_call(self, name, params):
-        params_str = _short_repr(params)
-        self._append_raw(
-            '<span class="tool">&rarr;</span> '
-            '<span class="fn">%s</span>'
-            '<span class="tool">(%s)</span>'
-            % (html.escape(name), html.escape(params_str))
-        )
+        self._append_raw(_html_tool_call(name, params))
 
     def _append_tool_result(self, name, result, is_error):
-        short = (result or "").strip().splitlines()
-        preview = short[0] if short else ""
-        if len(preview) > 160:
-            preview = preview[:157] + "..."
-        extra = "" if len(short) <= 1 else "  (+%d more lines)" % (len(short) - 1)
-        if is_error:
-            self._append_raw(
-                '<span class="err">&larr; %s: %s%s</span>'
-                % (html.escape(name), html.escape(preview), html.escape(extra))
-            )
-        else:
-            self._append_raw(
-                '<span class="toolret">&larr;</span> '
-                '<span class="fn">%s</span>'
-                '<span class="toolret">: %s%s</span>'
-                % (html.escape(name), html.escape(preview), html.escape(extra))
-            )
+        # The name is already on the call line directly above, so the result
+        # row only carries the outcome -- same as the CLI.
+        self._append_raw(_html_tool_result(result, is_error))
 
     # ---------- button handlers ----------
     def _prompt_api_key(self):
@@ -1075,6 +1214,9 @@ class ClaudeChatForm(QtWidgets.QWidget):
         self.history = []
         self._pending_attachments = []
         self._undo_batches = []
+        # Drop the CLI-side conversation too, or the next CLI turn would
+        # resume a session that still remembers everything we just cleared.
+        self.cli_client.reset_session()
         self.act_undo.setEnabled(False)
         self._usage_totals = {
             "input_tokens": 0,
@@ -1121,26 +1263,114 @@ class ClaudeChatForm(QtWidgets.QWidget):
             self._cancel.set()
             self._append_sys("Cancellation requested...")
 
+    def _on_effort_changed(self, level):
+        self._effort = level
+        self._append_sys("Effort set to <b>%s</b>." % html.escape(level))
+
     def _on_auth_changed(self, idx):
-        """0 = API key, 1 = Claude CLI."""
+        """0 = API key, 1 = Claude CLI (subscription, tools over MCP)."""
         self._auth_mode = int(idx)
         cli_mode = (self._auth_mode == 1)
-        # Tools and "Allow edits" only apply in API-key mode (the CLI runs its
-        # own agent loop and doesn't see our IDA-side tools).
-        self.chk_tools.setEnabled(not cli_mode)
-        self.chk_edits.setEnabled(not cli_mode)
-        if cli_mode:
-            if not self.cli_client.available():
-                self._append_sys(
-                    "<b>claude</b> CLI not found on PATH. Install Claude Code "
-                    "and run <code>claude /login</code>, then restart IDA."
-                )
-            else:
-                self._append_sys(
-                    "CLI mode: Claude runs via the <code>claude</code> "
-                    "command in text-only mode. IDA tools are <b>not</b> "
-                    "available. Switch auth to <b>API key</b> for tool access."
-                )
+        # Both paths support tools now, so neither toggle is mode-specific.
+        self.chk_tools.setEnabled(True)
+        self.chk_edits.setEnabled(True)
+        if not cli_mode:
+            return
+        if not self.cli_client.available():
+            self._append_sys(
+                "<b>claude</b> CLI not found on PATH. Install Claude Code "
+                "and run <code>claude</code> once to log in, then restart IDA."
+            )
+            return
+        self._append_sys(
+            "CLI mode: turns run through the logged-in <code>claude</code> "
+            "binary and bill against your Claude subscription. IDA tools are "
+            "served to it over a local MCP server."
+        )
+
+    # ---------- MCP server ----------
+    def _ensure_mcp(self):
+        """Start (once) the localhost MCP server that fronts ida_tools.
+
+        Returns the server, or raises McpServerError. The CLI connects to it
+        fresh on every turn, so it has to outlive individual turns.
+        """
+        if self._mcp is not None and self._mcp.running():
+            return self._mcp
+        # Tools run through the same callable the API path uses, so "Allow
+        # edits", dry-run and the post-write view refresh all apply
+        # identically no matter which side drove the call.
+        self._mcp = IdaMcpServer(
+            tool_defs=ida_tools.get_tool_defs,
+            exec_tool=self._exec_tool_for_mcp,
+        )
+        self._mcp.start()
+        return self._mcp
+
+    def _exec_tool_for_mcp(self, name, params):
+        """MCP entry point: refuse anything outside a live CLI turn."""
+        if not self._cli_turn_active.is_set():
+            return (
+                "Rejected: no Claude Code turn is currently active in the IDA "
+                "panel. This tool is only callable while the user has a turn "
+                "in flight.",
+                True,
+            )
+        return self._exec_tool_on_main_thread(name, params)
+
+    def _stop_mcp(self):
+        if self._mcp is not None:
+            self._mcp.stop()
+            self._mcp = None
+
+    def _cli_workspace(self):
+        """Working directory for the CLI process.
+
+        Pinning it to the IDB's directory keeps `--resume` sessions stable
+        across turns (the CLI keys session storage on cwd) and gives the
+        agent a sensible place to look if the user enables file tools.
+        """
+        try:
+            import idc
+            path = idc.get_idb_path() or ""
+            folder = os.path.dirname(path)
+            if folder and os.path.isdir(folder):
+                return folder
+        except Exception:
+            pass
+        return os.path.expanduser("~")
+
+    def _on_diagnostics(self):
+        lines = []
+        path = self.cli_client.cli_path
+        if path:
+            lines.append("claude CLI: <code>%s</code>" % html.escape(path))
+            ver = self.cli_client.version()
+            if ver:
+                lines.append("version: %s" % html.escape(ver))
+        else:
+            lines.append("claude CLI: <b>not found on PATH</b>")
+        lines.append("CLI session: %s"
+                     % html.escape(self.cli_client.session_id or "(none yet)"))
+        lines.append("workspace: <code>%s</code>"
+                     % html.escape(self._cli_workspace()))
+        if self._mcp is not None and self._mcp.running():
+            lines.append("MCP endpoint: <code>%s</code> (%d tools)"
+                         % (html.escape(self._mcp.url),
+                            len(ida_tools.get_tool_defs())))
+        else:
+            lines.append("MCP endpoint: not started (starts on the first "
+                         "CLI turn)")
+        lines.append("API key: %s"
+                     % ("set" if self.client.api_key else "not set"))
+        self._append_sys("<br>".join(lines))
+
+    def closeEvent(self, event):
+        self._stop_mcp()
+        try:
+            super(ClaudeChatForm, self).closeEvent(event)
+        except Exception:
+            pass
 
     def _on_send_clicked(self):
         if self._busy:
@@ -1211,6 +1441,33 @@ class ClaudeChatForm(QtWidgets.QWidget):
         use_tools = self.chk_tools.isChecked()
         auth_mode = self._auth_mode
         max_steps = int(self.spin_budget.value())
+        # Older models (Haiku 4.5 here) reject the effort parameter outright,
+        # so only send it where it exists.
+        effort = self._effort if model_supports_effort(model) else None
+
+        # CLI mode: bring up the MCP bridge before the worker starts so a
+        # bind failure surfaces as a plain error instead of a dead turn.
+        mcp_config = None
+        cli_cwd = None
+        cli_prompt = user_message
+        if auth_mode == 1:
+            cli_cwd = self._cli_workspace()
+            if use_tools:
+                try:
+                    mcp_config = self._ensure_mcp().mcp_config_json()
+                except McpServerError as e:
+                    # Route the failure through the normal finish path so
+                    # history rollback, dry-run reset and button state are all
+                    # handled in one place.
+                    self.bridge.finished.emit(
+                        "Could not start the MCP server: %s" % e, True)
+                    return
+            # A fresh CLI session doesn't know about turns that happened in
+            # API mode (or before a restart), so seed it with the transcript
+            # once; later turns resume server-side and send only the message.
+            if not self.cli_client.session_id and self._turn_history_base:
+                cli_prompt = _flatten_history_prefix(
+                    self.history[:self._turn_history_base]) + user_message
 
         def on_usage(u):
             self.bridge.event.emit("usage", u)
@@ -1222,10 +1479,25 @@ class ClaudeChatForm(QtWidgets.QWidget):
                 "limit": int(limit),
             })
 
+        # Open the MCP gate only for the duration of this turn.
+        if auth_mode == 1 and mcp_config:
+            self._cli_turn_active.set()
+
         def worker():
             try:
                 if auth_mode == 1:
-                    reply = self.cli_client.send(model, self.history)
+                    # The CLI owns its own agent loop and its own conversation
+                    # state; our history is kept only for the transcript and
+                    # for a later switch back to API mode.
+                    reply = self.cli_client.run_agent_turn(
+                        model=model,
+                        prompt=cli_prompt,
+                        on_event=lambda k, p: self.bridge.event.emit(k, p),
+                        is_cancelled=self._cancel.is_set,
+                        mcp_config_json=mcp_config,
+                        cwd=cli_cwd,
+                        effort=effort,
+                    )
                     self.history.append(
                         {"role": "assistant", "content": reply}
                     )
@@ -1240,6 +1512,7 @@ class ClaudeChatForm(QtWidgets.QWidget):
                         max_steps=max_steps,
                         on_usage=on_usage,
                         on_wait=on_wait,
+                        effort=effort,
                     )
                 else:
                     reply = self.client.send(
@@ -1249,12 +1522,13 @@ class ClaudeChatForm(QtWidgets.QWidget):
                             "text_delta", {"text": t, "step": 0}),
                         is_cancelled=self._cancel.is_set,
                         on_wait=on_wait,
+                        effort=effort,
                     )
                     self.history.append(
                         {"role": "assistant", "content": reply}
                     )
                 self.bridge.finished.emit(reply, False)
-            except CancelledError:
+            except (CancelledError, CliCancelled):
                 self.bridge.finished.emit("cancelled", True)
             except (ClaudeError, CliError) as e:
                 self.bridge.finished.emit(str(e), True)
@@ -1265,17 +1539,21 @@ class ClaudeChatForm(QtWidgets.QWidget):
 
     # ---------- tool dispatch ----------
     def _exec_tool_on_main_thread(self, name, params):
-        if name in ida_tools.WRITE_TOOLS and not self.chk_edits.isChecked():
-            return (
-                "Edit tool '%s' is disabled: the user has 'Allow edits' "
-                "unchecked. Tell the user to enable it if they want this "
-                "edit." % name,
-                True,
-            )
         box = {"result": ("no result", True)}
         is_write = name in ida_tools.WRITE_TOOLS
 
         def run():
+            # The "Allow edits" read happens here, not in the caller: this
+            # runs on IDA's main thread, and Qt widgets must not be touched
+            # from the API worker or an MCP request thread.
+            if is_write and not self.chk_edits.isChecked():
+                box["result"] = (
+                    "Edit tool '%s' is disabled: the user has 'Allow edits' "
+                    "unchecked. Tell the user to enable it if they want this "
+                    "edit." % name,
+                    True,
+                )
+                return 1
             try:
                 box["result"] = ida_tools.dispatch(name, params)
             except Exception as e:
@@ -1323,7 +1601,18 @@ class ClaudeChatForm(QtWidgets.QWidget):
             self._commit_stream_block()
             self._start_stream_block()
         elif kind == "text_delta":
+            self._thinking_tail = ""
             self._append_stream_delta(payload.get("text", ""))
+        elif kind == "thinking_delta":
+            # Reasoning summaries land in the status line rather than the
+            # transcript: they'd otherwise bury the answer, but without them
+            # a thinking model looks frozen before its first token.
+            tail = (getattr(self, "_thinking_tail", "")
+                    + (payload.get("text") or ""))
+            self._thinking_tail = tail[-160:]
+            self._refresh_status()
+        elif kind == "notice":
+            self._append_sys(html.escape(payload.get("text", "")))
         elif kind == "usage":
             self._accumulate_usage(payload or {})
         elif kind == "throttle":
@@ -1370,6 +1659,10 @@ class ClaudeChatForm(QtWidgets.QWidget):
 
     def _on_finished(self, text, is_error):
         self._busy = False
+        self._thinking_tail = ""
+        # Close the MCP gate: any tool call arriving after this point belongs
+        # to a process we no longer own.
+        self._cli_turn_active.clear()
         self.btn_cancel.setVisible(False)
         self.btn_send.setVisible(True)
         self._update_send_enabled()
@@ -1477,7 +1770,7 @@ class ClaudeChatForm(QtWidgets.QWidget):
         cursor.movePosition(
             QtGui.QTextCursor.End, QtGui.QTextCursor.KeepAnchor)
         cursor.removeSelectedText()
-        cursor.insertHtml('<div class="claude">' + html_body + '</div>')
+        cursor.insertHtml(_html_assistant(html_body))
         sb = self.conversation.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -1525,7 +1818,7 @@ class ClaudeChatForm(QtWidgets.QWidget):
 
     def _refresh_status(self):
         t = self._usage_totals
-        self.status_label.setText(
+        line = (
             "tokens: in=%s out=%s  cache: read=%s created=%s  "
             "tool calls: %s" % (
                 _fmt_int(t.get("input_tokens", 0)),
@@ -1535,6 +1828,10 @@ class ClaudeChatForm(QtWidgets.QWidget):
                 _fmt_int(t.get("tool_calls", 0)),
             )
         )
+        tail = getattr(self, "_thinking_tail", "")
+        if self._busy and tail:
+            line = "thinking: " + " ".join(tail.split())[-90:] + "   |   " + line
+        self.status_label.setText(line)
 
     # ---------- undo ----------
     def _on_undo(self):
@@ -1556,6 +1853,34 @@ class ClaudeChatForm(QtWidgets.QWidget):
 
 
 # ---------- formatting helpers ----------
+
+def _flatten_history_prefix(history, max_turns=8, max_chars=12000):
+    """Render prior turns as plain text for a brand-new CLI session.
+
+    Only used once per CLI conversation: afterwards the CLI resumes its own
+    session and we send just the new message. Tool-use blocks are skipped --
+    the CLI can re-run any tool it needs.
+    """
+    parts = []
+    for m in history[-max_turns:]:
+        content = m.get("content")
+        if isinstance(content, list):
+            content = "\n".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        if not isinstance(content, str) or not content.strip():
+            continue
+        tag = "User" if m.get("role") == "user" else "Assistant"
+        parts.append("%s: %s" % (tag, content.strip()))
+    if not parts:
+        return ""
+    body = "\n\n".join(parts)
+    if len(body) > max_chars:
+        body = "...\n" + body[-max_chars:]
+    return ("=== Earlier conversation in this IDA session ===\n"
+            + body + "\n=== End of earlier conversation ===\n\n")
+
 
 def _fmt_int(n):
     """Compact int formatter: 12345 -> '12.3K', 1234567 -> '1.23M'."""

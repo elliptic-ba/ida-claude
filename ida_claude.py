@@ -182,6 +182,13 @@ class ClaudeChatPlugin(idaapi.plugin_t):
             except Exception:
                 pass
             self._action_registered = False
+        if self.widget is not None:
+            # Tear down the local MCP server that fronts the IDA tools for
+            # the `claude` CLI; otherwise its listener outlives the plugin.
+            try:
+                self.widget._stop_mcp()
+            except Exception:
+                pass
         if self.dock is not None:
             try:
                 self.dock.close()
