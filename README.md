@@ -1,9 +1,10 @@
 # Claude Code for IDA Pro
 
 An IDA Pro plugin that embeds Claude as a dockable chat panel. Ask questions
-about the current function, run an agent loop that drives the database
-(list / read / rename / comment / jump), or fall back to a plain chat with
-the logged-in `claude` CLI.
+about the current function or run an agent loop that drives the database
+(list / read / rename / comment / jump) — either through the Anthropic API
+with a key, or through the logged-in `claude` CLI on your Claude
+subscription. Both paths get the same IDA tools.
 
 ![Claude Code UI](Capture1.png)
 
@@ -13,12 +14,27 @@ the logged-in `claude` CLI.
   Functions / Imports), Ctrl+Shift+K to open.
 - **Claude-style UI** — rounded dark input card with toolbar, coral send
   button, and a sliders menu.
-- **Two auth modes**
-  - *API key* — calls the Anthropic Messages API directly. Required for
-    tool use.
-  - *Claude CLI (account)* — shells out to the logged-in `claude` binary
-    (same account as Claude Code in VS Code), no key required. Text-only.
-- **IDA tools Claude can call** (API-key mode):
+- **Terminal-style transcript** — the conversation renders the way Claude
+  Code does in a terminal: monospace throughout, `>` for your prompt, a
+  coral `●` per assistant turn and tool call, and results hanging off a
+  `└` branch. Tool activity is shown by default (untick *Show tool
+  activity* for prose only).
+- **Two auth modes, both with full tool use**
+  - *API key* — calls the Anthropic Messages API directly and runs the
+    agent loop in-process. Billed as API usage.
+  - *Claude CLI (subscription)* — drives the logged-in `claude` binary
+    (same account as Claude Code in the terminal), no key required. The
+    plugin starts a local **MCP server** inside IDA and hands it to the CLI,
+    so the CLI's own agent loop calls the same IDA tools. Usage counts
+    against your Claude plan rather than API credits.
+- **MCP bridge** — a localhost-only, bearer-token-authenticated MCP server
+  (`127.0.0.1`, random port, token regenerated per panel) exposing all 51
+  IDA tools. It is passed to the CLI with `--strict-mcp-config`, and the
+  CLI's built-in file/shell tools are disabled, so a CLI turn can touch the
+  IDB and nothing else. Tool calls are additionally refused unless a turn is
+  actually in flight, so a `claude` process that outlives a cancel can't
+  keep editing the database.
+- **IDA tools Claude can call** (both modes):
   - *read / navigate:* `read_function`, `list_functions`, `list_strings`,
     `list_imports`, `list_exports`, `list_globals`, `get_xrefs_to`,
     `get_xrefs_from`, `xrefs_to_field`, `read_bytes`, `get_int`,
@@ -48,7 +64,16 @@ the logged-in `claude` CLI.
 - **Resilient history** — the conversation is sanitized on startup and
   after every turn, so cancelled tool calls never leave orphan `tool_use`
   blocks that would 400 the next request.
-- **Model picker** — Opus 4.7, Opus 4.6, Sonnet 4.6, Haiku 4.5.
+- **Streaming with live reasoning** — text streams token-by-token in both
+  modes; while the model is thinking, a summary of its reasoning ticks along
+  in the status line instead of a silent pause.
+- **Model picker** — Opus 5 (default), Sonnet 5, Haiku 4.5, Opus 4.8,
+  Fable 5. The same id is used for the API (`model`) and the CLI
+  (`--model`).
+- **Effort control** — `low` / `medium` / `high` / `xhigh` / `max` in the
+  settings menu, mapped to `output_config.effort` (API) and `--effort`
+  (CLI). Lower is cheaper and faster; higher digs deeper on hard binaries.
+  Skipped automatically for models that don't support it (Haiku 4.5).
 
 ## Requirements
 
@@ -56,7 +81,9 @@ the logged-in `claude` CLI.
 - Hex-Rays decompiler (optional; used only if "Include decomp" is checked).
 - One of:
   - An Anthropic API key, or
-  - The `claude` CLI on PATH, logged in via `claude /login`.
+  - Claude Code (`claude`) on PATH and logged in. Tool use over MCP needs a
+    reasonably recent build — `claude --version` ≥ 2.0 — since it relies on
+    `--mcp-config`, `--strict-mcp-config` and `--output-format stream-json`.
 
 No third-party Python packages are needed — the client uses only the stdlib.
 
@@ -77,19 +104,24 @@ No third-party Python packages are needed — the client uses only the stdlib.
 
 Pick one:
 
-**API key (recommended — enables tools)**
+**API key**
 - Set `ANTHROPIC_API_KEY` in your environment before launching IDA, **or**
-- Open the panel and click **API Key...** to paste it for the session
+- Open the panel and click **Set API key...** to paste it for the session
   (kept in memory only, not written to disk).
 
-**Claude CLI (uses your logged-in account)**
+**Claude CLI (uses your logged-in account / subscription)**
 - Install Claude Code: <https://docs.claude.com/claude-code>
-- Run `claude /login` in a terminal and complete the browser sign-in.
+- Run `claude` in a terminal once and complete the browser sign-in.
 - Verify `claude --version` works from a plain shell.
-- In the panel, set **Auth** to **Claude CLI (account)**.
+- In the panel, set **Auth** to **Claude CLI (subscription)**.
 
 The panel auto-selects CLI mode if the binary is on PATH and no API key is
-set.
+set. Tool use works in either mode; the difference is what gets billed.
+
+Note that IDA must be able to see the same PATH your terminal does — if you
+installed Claude Code after IDA was started, restart IDA. **CLI / MCP
+diagnostics** in the settings menu prints the binary, version, session id
+and MCP endpoint the panel resolved.
 
 ## Usage
 
@@ -118,26 +150,31 @@ behind the **sliders icon**  to the left of the attach button.
 |--------------------------|------------------------------------------------------|
 | Auth → API key / CLI     | Choose between Anthropic API and the `claude` CLI.   |
 | Set API key...           | Paste a key for this IDA session.                    |
-| Use tools                | Let Claude call IDA tools in an agent loop.          |
+| Effort                   | low / medium / high / xhigh / max per turn.          |
+| Use tools                | Let Claude call IDA tools in an agent loop (both modes).|
 | Allow edits              | Permit write tools (rename, comment, patch, ...).    |
 | Include decomp           | Attach Hex-Rays pseudocode along with disassembly.   |
 | Auto-attach context      | Attach current function / selection to each message. |
 | Dry run                  | Write tools report `(dry-run) would ...` only.       |
-| Show tool activity       | Render each `→ tool / ← result` inline (off = quiet).|
-| Max tool calls           | Hard cap on agent loop steps per turn.               |
+| Show tool activity       | Render each `● tool(args)` / `└ result` inline (on by default).|
+| Max tool calls           | Hard cap on agent loop steps per turn (API mode).    |
+| CLI / MCP diagnostics    | Print CLI path, version, session id, MCP endpoint.   |
 | Undo last batch          | Revert the edits made by the most recent turn.       |
-| Clear conversation       | Wipe history and start over.                         |
+| Clear conversation       | Wipe history and start over (also drops the CLI session).|
 
 ### Tips
 
-- **CLI mode is text-only.** IDA tools aren't invoked; Claude sees only the
-  attached function text you send. Switch to API-key mode for agent runs.
+- **CLI mode bills your subscription, not API credits** — the practical
+  reason to use it. Tool use is the same; only the transport differs.
+- **Max tool calls applies to API mode only.** In CLI mode the `claude`
+  binary owns the loop and stops when it's done.
 - **Leave "Allow edits" off** during exploratory chats and flip it on when
   you explicitly want Claude to rename / comment.
 - **Highlight a range** in the disasm or pseudocode view before asking a
   question to scope the answer to that slice. No highlight = full function.
-- **Tool chatter is hidden by default.** Flip *Show tool activity* in the
-  settings menu if you want to watch the agent's `→ tool / ← result` trace.
+- **Tool chatter is shown by default**, terminal-style. Untick *Show tool
+  activity* in the settings menu if you'd rather read only the prose; the
+  status line still counts the calls.
 - Quoting an address like `0x401200` in Claude's reply is clickable via
   IDA's jump history — or ask Claude to `jump_to` it directly.
 
@@ -150,7 +187,8 @@ ida-pro-claude/
     __init__.py
     chat_widget.py         # ClaudeChatForm: the Qt panel
     claude_client.py       # stdlib-only Anthropic Messages API client
-    cli_client.py          # wrapper around the `claude` CLI binary
+    cli_client.py          # drives the `claude` CLI, parses its stream-json
+    mcp_server.py          # localhost MCP server exposing ida_tools to the CLI
     ida_context.py         # pulls function context (disasm + decomp) from IDA
     ida_tools.py           # @tool-decorated IDA operations exposed to Claude
   claude.png               # menu icon
@@ -162,16 +200,27 @@ ida-pro-claude/
 - **"No API key detected"** — set `ANTHROPIC_API_KEY` or click *API Key...*,
   or switch **Auth** to Claude CLI.
 - **"`claude` CLI not found on PATH"** — install Claude Code and make sure
-  its install dir is on PATH before launching IDA; run `claude /login`.
-- **Tools greyed out** — you're in CLI mode. CLI runs its own agent loop and
-  doesn't see our IDA-side tools. Switch to API key.
+  its install dir is on PATH before launching IDA; run `claude` once to log
+  in.
+- **"MCP server(s) failed to connect"** in CLI mode — the `claude` process
+  couldn't reach the panel's localhost endpoint. Check the endpoint with
+  *CLI / MCP diagnostics*, and make sure a local firewall or proxy env var
+  (`HTTP_PROXY`/`ALL_PROXY` without a `127.0.0.1` exclusion in `NO_PROXY`)
+  isn't intercepting loopback traffic.
+- **"the previous CLI session could not be resumed"** — the stored session
+  was cleared or the IDB moved. The panel resets it; just send again.
+- **CLI turn says a tool was denied** — the CLI only pre-approves the MCP
+  tools; anything else (its own Bash/Read/Write) is refused by design.
 - **Panel disappears when clicking another tab** — it shouldn't; the plugin
   attaches to IDA's outer main window's right dock area rather than the
   central stacked widget. If it does, reopen via Ctrl+Shift+K.
 - **Edits rejected** — enable **Allow edits** in the gear menu.
 - **"Waiting Xs..." system lines** — the plugin is throttling to stay
   under the 30k input-tokens/min org limit, or the server returned a 429
-  and we're honoring its `retry-after`. It resumes automatically.
+  and we're honoring its `retry-after`. It resumes automatically. On a paid
+  tier that default is far too low (every request carries 51 tool
+  definitions) — raise it with `IDA_CLAUDE_TPM_LIMIT=200000` in the
+  environment before launching IDA. API mode only.
 - **Pseudocode didn't update after an edit** — should auto-refresh now.
   If a view is stale, press F5 to force a re-decompile.
 - **If you dont see plugins directory in APPDATA create it and add the code**

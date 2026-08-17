@@ -62,6 +62,35 @@ def _clone_tools_with_cache(tools):
     return out
 
 
+def _strip_thinking(history):
+    """Drop thinking blocks from assistant turns.
+
+    Needed when the picker switches mid-conversation to a model that doesn't
+    do adaptive thinking (Haiku 4.5 here): the transcript still carries
+    thinking blocks produced by, say, Opus 5. An assistant turn that held
+    nothing but thinking would become empty, which the API rejects, so it
+    keeps a placeholder instead.
+    """
+    out = []
+    for msg in history:
+        content = msg.get("content")
+        if msg.get("role") != "assistant" or not isinstance(content, list):
+            out.append(msg)
+            continue
+        kept = [b for b in content
+                if not (isinstance(b, dict)
+                        and b.get("type") in ("thinking", "redacted_thinking"))]
+        if len(kept) == len(content):
+            out.append(msg)
+            continue
+        if not kept:
+            kept = [{"type": "text", "text": "(reasoning omitted)"}]
+        msg = dict(msg)
+        msg["content"] = kept
+        out.append(msg)
+    return out
+
+
 def _messages_with_cache(history):
     """Return a deep copy of history with cache_control on the final content
     block of the most recent message. Caches the conversation up through that
@@ -94,6 +123,59 @@ def _system_blocks():
     }]
 
 
+# --- per-model request shaping ---
+
+# Models predating the 4.6 generation reject `thinking: {"type": "adaptive"}`
+# and `output_config.effort`, so we only send those to models that take them.
+# (Haiku 4.5 is the one in our picker that doesn't.)
+_NO_ADAPTIVE_PREFIXES = (
+    "claude-haiku",
+    "claude-3",
+    "claude-2",
+    "claude-sonnet-4-0",
+    "claude-sonnet-4-5",
+    "claude-opus-4-0",
+    "claude-opus-4-1",
+    "claude-opus-4-5",
+)
+
+
+def _takes_adaptive_thinking(model):
+    model = (model or "").lower()
+    return not any(model.startswith(p) for p in _NO_ADAPTIVE_PREFIXES)
+
+
+def model_supports_effort(model):
+    """Public gate, used by the CLI path too (`--effort` has the same
+    per-model support as `output_config.effort`)."""
+    return _takes_adaptive_thinking(model)
+
+
+def _prepare_messages(history, model):
+    """History as the wire wants it for `model` (cache markers, no stray
+    thinking blocks on models that can't take them)."""
+    if not _takes_adaptive_thinking(model):
+        history = _strip_thinking(history)
+    return _messages_with_cache(history)
+
+
+def _apply_model_options(payload, model, effort=None):
+    """Add thinking/effort to a request when the model supports them.
+
+    Thinking is left on (adaptive) deliberately: on Opus 5 it is the default,
+    and turning it off there has known failure modes -- the model can emit a
+    tool call as plain text, which in an agent loop looks like a turn that
+    silently did nothing. `display: summarized` gives us reasoning summaries
+    to show while the model works instead of a long silent pause.
+    """
+    if not _takes_adaptive_thinking(model):
+        return payload
+    payload["thinking"] = {"type": "adaptive", "display": "summarized"}
+    if effort:
+        payload["output_config"] = {"effort": effort}
+    return payload
+
+
 class ClaudeClient:
     # Default input-tokens-per-minute budget. Anthropic's free-tier / default
     # org limit for most Claude models is 30k input tokens/min; staying a bit
@@ -104,6 +186,15 @@ class ClaudeClient:
     def __init__(self, api_key=None, tpm_limit=None):
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self.endpoint = "https://api.anthropic.com/v1/messages"
+        # The 30k default is the free/default-tier ceiling. Paid tiers are far
+        # higher, and with 51 tool definitions in every request the client-side
+        # throttle is the binding constraint long before the server's is --
+        # hence the env override.
+        if tpm_limit is None:
+            try:
+                tpm_limit = int(os.environ.get("IDA_CLAUDE_TPM_LIMIT") or 0)
+            except ValueError:
+                tpm_limit = 0
         self.tpm_limit = int(tpm_limit or self.DEFAULT_TPM_LIMIT)
         # Sliding 60s window of (timestamp, estimated_tokens) reservations.
         self._tpm_window = []
@@ -264,7 +355,7 @@ class ClaudeClient:
     # ---------- SSE streaming ----------
 
     def _stream(self, payload, on_text_delta, is_cancelled, timeout=300,
-                on_wait=None):
+                on_wait=None, on_thinking_delta=None):
         """Open a streaming response, parse SSE, and return
         (content_blocks, stop_reason, usage_dict).
 
@@ -332,6 +423,12 @@ class ClaudeClient:
                         elif cb.get("type") == "tool_use":
                             cb.setdefault("input", {})
                             tool_json_buf[idx] = ""
+                        elif cb.get("type") == "thinking":
+                            # Rebuilt verbatim (text + signature) because the
+                            # API rejects modified thinking blocks when they
+                            # are replayed on the next request.
+                            cb.setdefault("thinking", "")
+                            cb.setdefault("signature", "")
                         blocks[idx] = cb
                     elif t == "content_block_delta":
                         idx = evt.get("index", 0)
@@ -350,6 +447,17 @@ class ClaudeClient:
                         elif delta.get("type") == "input_json_delta":
                             tool_json_buf[idx] = tool_json_buf.get(idx, "") \
                                 + delta.get("partial_json", "")
+                        elif delta.get("type") == "thinking_delta":
+                            txt = delta.get("thinking", "")
+                            cb["thinking"] = cb.get("thinking", "") + txt
+                            if txt and on_thinking_delta:
+                                try:
+                                    on_thinking_delta(txt)
+                                except Exception:
+                                    pass
+                        elif delta.get("type") == "signature_delta":
+                            cb["signature"] = cb.get("signature", "") \
+                                + delta.get("signature", "")
                     elif t == "content_block_stop":
                         idx = evt.get("index", 0)
                         cb = blocks.get(idx)
@@ -395,21 +503,22 @@ class ClaudeClient:
 
     # ---------- plain chat (no tools) ----------
 
-    def send(self, model, history, max_tokens=4096, on_usage=None,
+    def send(self, model, history, max_tokens=16000, on_usage=None,
              on_text_delta=None, is_cancelled=None, stream=True,
-             on_wait=None):
+             on_wait=None, effort=None, on_thinking_delta=None):
         if is_cancelled is None:
             is_cancelled = lambda: False  # noqa: E731
         payload = {
             "model": model,
             "max_tokens": max_tokens,
             "system": _system_blocks(),
-            "messages": _messages_with_cache(history),
+            "messages": _prepare_messages(history, model),
         }
+        _apply_model_options(payload, model, effort)
         if stream:
             blocks, _sr, usage = self._stream(
                 payload, on_text_delta or (lambda t: None), is_cancelled,
-                on_wait=on_wait)
+                on_wait=on_wait, on_thinking_delta=on_thinking_delta)
             if on_usage:
                 try:
                     on_usage(usage)
@@ -432,8 +541,8 @@ class ClaudeClient:
     # ---------- agent loop with tools ----------
 
     def run_agent_turn(self, model, history, tools, exec_tool, on_event,
-                       is_cancelled, max_tokens=4096, max_steps=50,
-                       on_usage=None, stream=True, on_wait=None):
+                       is_cancelled, max_tokens=16000, max_steps=50,
+                       on_usage=None, stream=True, on_wait=None, effort=None):
         """Drive a single 'user turn' through as many tool calls as Claude needs.
 
         Arguments:
@@ -466,14 +575,19 @@ class ClaudeClient:
                 "max_tokens": max_tokens,
                 "system": _system_blocks(),
                 "tools": cached_tools,
-                "messages": _messages_with_cache(history),
+                "messages": _prepare_messages(history, model),
             }
+            _apply_model_options(payload, model, effort)
 
             if stream:
                 def _emit_text(txt, _step=step):
                     on_event("text_delta", {"text": txt, "step": _step})
+
+                def _emit_thinking(txt):
+                    on_event("thinking_delta", {"text": txt})
                 content, stop_reason, usage = self._stream(
-                    payload, _emit_text, is_cancelled, on_wait=on_wait)
+                    payload, _emit_text, is_cancelled, on_wait=on_wait,
+                    on_thinking_delta=_emit_thinking)
                 if on_usage:
                     try:
                         on_usage(usage)
@@ -492,6 +606,16 @@ class ClaudeClient:
 
             history.append({"role": "assistant", "content": content})
             tool_uses = [b for b in content if b.get("type") == "tool_use"]
+
+            if stop_reason == "refusal":
+                # Newer models can decline server-side (HTTP 200, empty or
+                # partial content). Say so plainly instead of surfacing an
+                # empty turn.
+                return (
+                    "(The model declined this request -- its safety "
+                    "classifiers rejected it. Rephrasing, or switching to "
+                    "another model in the picker, usually works.)"
+                )
 
             if stop_reason != "tool_use" or not tool_uses:
                 texts = [b.get("text", "") for b in content
