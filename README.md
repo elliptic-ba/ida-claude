@@ -1,10 +1,23 @@
-# Claude Code for IDA Pro
+<div align="center">
 
-An IDA Pro plugin that embeds Claude as a dockable chat panel. Ask questions
-about the current function or run an agent loop that drives the database
-(list / read / rename / comment / jump) — either through the Anthropic API
-with a key, or through the logged-in `claude` CLI on your Claude
-subscription. Both paths get the same IDA tools.
+# Claude Code for IDA Pro 🧩
+
+
+### An IDA Pro plugin that embeds Claude as a dockable chat panel
+
+Ask questions about the current function or run an agent loop that drives the
+database (list / read / rename / comment / jump) — either through the Anthropic
+API with a key, or through the logged-in `claude` CLI on your subscription.
+Both paths get the same **51 IDA tools**.
+
+![IDA Pro](https://img.shields.io/badge/IDA%20Pro-7.4+-red)
+![Claude](https://img.shields.io/badge/Claude-Opus%205-D97757?logo=anthropic&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3-3776AB?logo=python&logoColor=white)
+![deps](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen)
+
+[Features](#features) · [Requirements](#requirements) · [Installation](#installation) · [Usage](#usage) · [Troubleshooting](#troubleshooting)
+
+</div>
 
 ![Claude Code UI](Capture1.png)
 
